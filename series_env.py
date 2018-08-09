@@ -8,17 +8,77 @@ import os.path as osp
 import random
 
 
+class PnlSnapshot:
+    def __init__(self, ):
+        self.m_net_position = 0
+        self.m_avg_open_price = 0
+        self.m_net_investment = 0
+        self.m_realized_pnl = 0
+        self.m_unrealized_pnl = 0
+        self.m_total_pnl = 0
+
+    # buy_or_sell: 1 is buy, 2 is sell
+    def update_by_tradefeed(self, buy_or_sell, traded_price, traded_quantity):
+        assert (buy_or_sell == 1 or buy_or_sell == 2)
+
+        if buy_or_sell == 2 and (traded_quantity > self.m_net_position):
+            # Do nothing to stop us from shorting the stock
+            return
+
+        if buy_or_sell == 1 and self.m_net_position >= 1:
+            return
+
+
+        if buy_or_sell == 2 and self.m_net_position <= -1:
+            return
+
+        # buy: positive position, sell: negative position
+        quantity_with_direction = traded_quantity if buy_or_sell == 1 else (-1) * traded_quantity
+        is_still_open = (self.m_net_position * quantity_with_direction) >= 0
+
+        # net investment
+        self.m_net_investment = max( self.m_net_investment, abs( self.m_net_position * self.m_avg_open_price  ) )
+        # realized pnl
+        if not is_still_open:
+            # Remember to keep the sign as the net position
+            self.m_realized_pnl += ( traded_price - self.m_avg_open_price ) * \
+                min(
+                    abs(quantity_with_direction),
+                    abs(self.m_net_position)
+                ) * ( abs(self.m_net_position) / self.m_net_position )
+        # total pnl
+        self.m_total_pnl = self.m_realized_pnl + self.m_unrealized_pnl
+        # avg open price
+        if is_still_open:
+            self.m_avg_open_price = ( ( self.m_avg_open_price * self.m_net_position ) +
+                ( traded_price * quantity_with_direction ) ) / ( self.m_net_position + quantity_with_direction )
+        else:
+            # Check if it is close-and-open
+            if traded_quantity > abs(self.m_net_position):
+                self.m_avg_open_price = traded_price
+        # net position
+        self.m_net_position += quantity_with_direction
+
+    def update_by_marketdata(self, last_price):
+        self.m_unrealized_pnl = ( last_price - self.m_avg_open_price ) * self.m_net_position
+        self.m_total_pnl = self.m_realized_pnl + self.m_unrealized_pnl
+
+
+
+
+
 
 class SeriesEnv(Env):
     def __init__(self):
         base_path = '/home/andy/Documents/quant/data/PRICING/minute/'
         symb = 'AAPL'
-        window_length = 30
+        window_length = 32
+        self.calc_pct = True
 
-        self.observation_space = Box(low=0, high=1, shape=(window_length,),
+        self.observation_space = Box(low=0, high=1, shape=(window_length,5),
                 dtype=np.float32)
         # have three options. Buy, sell or hold
-        self.action_space = Discrete(2)
+        self.action_space = Discrete(3)
 
         self.window_length = window_length
 
@@ -45,11 +105,14 @@ class SeriesEnv(Env):
         df = df.drop(df.index[remove_indices])
 
         # We only care about closes.
-        self.closes = df['close']
+        self.closes = df[['open','high', 'low', 'close', 'volume']]
+        self.closes = self.closes[self.closes.index > '2018-06-01']
 
         self.cur_i = 0
 
-        self.reset()
+        self.rand_seed()
+
+
 
     def render(self, mode='human'):
         raise NotImplemented('No render function')
@@ -60,6 +123,19 @@ class SeriesEnv(Env):
 
     def seed(self, s):
         self.cur_i = s % len(self.closes)
+        use_date = self.closes.index[self.cur_i].date()
+
+        scan_i = self.cur_i
+        while scan_i >= 0:
+            if use_date != self.closes.index[scan_i].date():
+                break
+
+            scan_i -= 1
+
+        self.cur_i = scan_i + 1
+
+    def get_net_pos(self):
+        return self.pnl.m_net_position
 
     def get_cur_date(self):
         return self.closes.index[self.cur_i]
@@ -68,62 +144,50 @@ class SeriesEnv(Env):
         if (self.cur_i + self.window_length) >= len(self.closes):
             self.cur_i = 0
 
-        obs = self.closes[self.cur_i:self.cur_i + self.window_length]
+        obs = self.closes.iloc[self.cur_i:self.cur_i + self.window_length]
 
-        days = [dt.day for dt in obs.index]
-        start_day = days[-1]
-        break_i = None
-        for i, day in enumerate(reversed(days)):
-            if day != start_day:
-                break_i = len(days) - i
-                break
+        start_date = obs.index[0].date()
+        end_date = obs.index[-1].date()
 
-        if break_i is not None:
-            eod_price = self.closes[break_i - 1]
-
-            use_index = break_i + self.cur_i
-            obs = self.closes[use_index : use_index + self.window_length]
-            self.cur_i = use_index
+        if start_date != end_date:
+            done = True
+            self.cur_i = self.cur_i + self.window_length
         else:
-            eod_price = None
-            self.cur_i += 1
+            done = False
 
-        pct_diffs = obs.pct_change().fillna(method='bfill')
+        self.cur_i += 1
 
-        return pct_diffs.values, eod_price, obs[-1]
+        if self.calc_pct:
+            obs = obs.pct_change().fillna(method='bfill')
+
+        # Third index is the close.
+        return obs.values, obs.iloc[-1]['close'], done
 
 
     def step(self, action):
-        obs, eod_price, last_price = self.__get_obs()
-
-        # do nothing: 0
-        # buy/sell: 1
+        obs, last_price, done = self.__get_obs()
+        if done:
+            self.pnl = None
+            return obs, 0.0, done, {}
 
         reward = 0
         done = False
 
-        if eod_price is not None and self.is_holding:
-            price_diff = eod_price - self.bought_price
-            reward = price_diff
-            done = True
-            self.is_holding = False
-        else:
-            if action == 1:
-                if self.is_holding:
-                    price_diff = last_price - self.bought_price
-                    reward = price_diff
-                    done = True
-                    self.is_holding = False
-                else:
-                    self.is_holding = True
-                    self.bought_price = last_price
+        self.pnl.update_by_marketdata(last_price)
+
+        if action != 0:
+            self.pnl.update_by_tradefeed(action, last_price, 1)
+
+        reward = self.pnl.m_total_pnl
 
         return obs, reward, done, {}
 
 
     def reset(self):
-        self.is_holding = False
-        self.bought_price = None
-        return self.__get_obs()[0]
+        obs = self.__get_obs()[0]
+        self.cur_i -= 1
+        self.pnl = PnlSnapshot()
+
+        return obs
 
 
