@@ -22,15 +22,17 @@ class PnlSnapshot:
         assert (buy_or_sell == 1 or buy_or_sell == 2)
 
         if buy_or_sell == 2 and (traded_quantity > self.m_net_position):
-            # Do nothing to stop us from shorting the stock
-            return
+            # Do nothing, to stop us from shorting the stock
+            return False
 
         if buy_or_sell == 1 and self.m_net_position >= 1:
-            return
-
+            # Do not allow to buy twice
+            return False
 
         if buy_or_sell == 2 and self.m_net_position <= -1:
-            return
+            raise ValueError('We should not have negative net poistion')
+
+
 
         # buy: positive position, sell: negative position
         quantity_with_direction = traded_quantity if buy_or_sell == 1 else (-1) * traded_quantity
@@ -58,6 +60,8 @@ class PnlSnapshot:
                 self.m_avg_open_price = traded_price
         # net position
         self.m_net_position += quantity_with_direction
+
+        return True
 
     def update_by_marketdata(self, last_price):
         self.m_unrealized_pnl = ( last_price - self.m_avg_open_price ) * self.m_net_position
@@ -101,17 +105,17 @@ class SeriesEnv(Env):
             return False
 
         remove_indices = [filter_func(x) for x in df.index]
+        self.actions = []
 
         df = df.drop(df.index[remove_indices])
 
         # We only care about closes.
         self.closes = df[['open','high', 'low', 'close', 'volume']]
-        self.closes = self.closes[self.closes.index > '2018-06-01']
+        self.closes = self.closes[(self.closes.index >= '2018-01-01') & (self.closes.index <= '2018-06-01')]
 
         self.cur_i = 0
 
         self.rand_seed()
-
 
 
     def render(self, mode='human'):
@@ -141,8 +145,10 @@ class SeriesEnv(Env):
         return self.closes.index[self.cur_i]
 
     def __get_obs(self):
+        done = False
         if (self.cur_i + self.window_length) >= len(self.closes):
             self.cur_i = 0
+            done = True
 
         obs = self.closes.iloc[self.cur_i:self.cur_i + self.window_length]
 
@@ -152,38 +158,45 @@ class SeriesEnv(Env):
         if start_date != end_date:
             done = True
             self.cur_i = self.cur_i + self.window_length
-        else:
+        elif self.cur_i != 0:
             done = False
 
         self.cur_i += 1
 
         if self.calc_pct:
-            obs = obs.pct_change().fillna(method='bfill')
+            obs_pct = obs.pct_change().fillna(method='bfill')
 
         # Third index is the close.
-        return obs.values, obs.iloc[-1]['close'], done
+        return obs_pct.values, obs.iloc[-1]['close'], done
 
 
     def step(self, action):
         obs, last_price, done = self.__get_obs()
-        if done:
-            self.pnl = None
-            return obs, 0.0, done, {}
 
         reward = 0
-        done = False
 
-        self.pnl.update_by_marketdata(last_price)
+        if not done:
+            self.pnl.update_by_marketdata(last_price)
 
-        if action != 0:
-            self.pnl.update_by_tradefeed(action, last_price, 1)
+            if action != 0:
+                result = self.pnl.update_by_tradefeed(action, last_price, 1)
+                if action == 1:
+                    a = 'Buy'
+                elif action == 2:
+                    a = 'Sell'
+
+                if result:
+                    self.actions.append([a, last_price, self.get_cur_date()])
 
         reward = self.pnl.m_total_pnl
+        if done:
+            self.pnl = None
 
         return obs, reward, done, {}
 
 
     def reset(self):
+        self.actions = []
         obs = self.__get_obs()[0]
         self.cur_i -= 1
         self.pnl = PnlSnapshot()
