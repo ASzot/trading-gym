@@ -7,6 +7,8 @@ import os
 import os.path as osp
 import random
 
+import util.time_helper as th
+
 
 class PnlSnapshot:
     def __init__(self, ):
@@ -73,14 +75,14 @@ class PnlSnapshot:
 
 
 class SeriesEnv(Env):
-    def __init__(self):
-        base_path = '/home/andy/Documents/quant/data/PRICING/minute/'
-        symb = 'AAPL'
+    def __init__(self, base_path, symb, start_date, end_date,
+            daily_start_time, daily_end_time, preproc=None):
         window_length = 32
         self.calc_pct = True
 
         self.observation_space = Box(low=0, high=1, shape=(window_length,5),
                 dtype=np.float32)
+
         # have three options. Buy, sell or hold
         self.action_space = Discrete(3)
 
@@ -91,47 +93,44 @@ class SeriesEnv(Env):
                             infer_datetime_format=False,
                             index_col=0)
 
-        def filter_func(x):
-            hour = x.hour
-            minute = x.minute
-            if hour == 9 and minute < 31:
-                return True
-            elif hour < 9:
-                return True
-            elif hour > 16:
-                return True
-            elif hour == 16 and minute > 0:
-                return True
-            return False
+        daily_start_time = th.mk_time_hours(daily_start_time)
+        daily_end_time = th.mk_time_hours(daily_end_time)
 
-        remove_indices = [filter_func(x) for x in df.index]
+        if start_date is not None:
+            df = df[df.index >= start_date]
+        if end_date is not None:
+            df = df[df.index <= end_date]
+
+        day_hours = df.index.hour + df.index.minute/60
+        df = df[(day_hours >= daily_start_time) & (day_hours <= daily_end_time)]
+
         self.actions = []
 
-        df = df.drop(df.index[remove_indices])
-
-        # We only care about closes.
-        self.closes = df[['open','high', 'low', 'close', 'volume']]
-        self.closes = self.closes[(self.closes.index >= '2018-01-01') & (self.closes.index <= '2018-06-01')]
-
+        self.data = df[['open','high', 'low', 'close', 'volume']]
+        replace_data = preproc.preproc(self.data.values)
+        self.data = pd.DataFrame(replace_data,
+                index=self.data.index[1:],
+                columns=self.data.columns)
         self.cur_i = 0
-
         self.rand_seed()
-
 
     def render(self, mode='human'):
         raise NotImplemented('No render function')
 
-
     def rand_seed(self):
-        self.seed(random.randint(0, len(self.closes)))
+        self.seed(random.randint(0, len(self.data)))
 
+    """
+    Seeds the environment to start at the index after s that is the first new
+    day
+    """
     def seed(self, s):
-        self.cur_i = s % len(self.closes)
-        use_date = self.closes.index[self.cur_i].date()
+        self.cur_i = s % len(self.data)
+        use_date = self.data.index[self.cur_i].date()
 
         scan_i = self.cur_i
         while scan_i >= 0:
-            if use_date != self.closes.index[scan_i].date():
+            if use_date != self.data.index[scan_i].date():
                 break
 
             scan_i -= 1
@@ -142,19 +141,23 @@ class SeriesEnv(Env):
         return self.pnl.m_net_position
 
     def get_cur_date(self):
-        return self.closes.index[self.cur_i]
+        return self.data.index[self.cur_i]
 
     def __get_obs(self):
         done = False
-        if (self.cur_i + self.window_length) >= len(self.closes):
+
+        # Finish if we have reached the end of our data.
+        if (self.cur_i + self.window_length) >= len(self.data):
             self.cur_i = 0
             done = True
 
-        obs = self.closes.iloc[self.cur_i:self.cur_i + self.window_length]
+        # Get our observation
+        obs = self.data.iloc[self.cur_i:self.cur_i + self.window_length]
 
         start_date = obs.index[0].date()
         end_date = obs.index[-1].date()
 
+        # Also end if the day is over
         if start_date != end_date:
             done = True
             self.cur_i = self.cur_i + self.window_length
@@ -163,11 +166,7 @@ class SeriesEnv(Env):
 
         self.cur_i += 1
 
-        if self.calc_pct:
-            obs_pct = obs.pct_change().fillna(method='bfill')
-
-        # Third index is the close.
-        return obs_pct.values, obs.iloc[-1]['close'], done
+        return obs.values, obs['close'].iloc[-1], done
 
 
     def step(self, action):
